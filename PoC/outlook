@@ -1,0 +1,232 @@
+import re
+from datetime import datetime
+import win32com.client
+
+
+# =========================
+# 설정값
+# =========================
+
+TARGET_ORG_KEYWORDS = [
+    "@example.org",       # 발신자 이메일 도메인
+    "진단센터",           # 발신자 이름에 포함될 키워드
+]
+
+SUBJECT_INCLUDE = [
+    "[진단결과]",
+]
+
+SUBJECT_EXCLUDE = [
+    "[RE]",
+    "RE:",
+    "[전달]",
+    "FW:",
+    "FWD:",
+]
+
+
+# =========================
+# 날짜 파싱
+# =========================
+
+def parse_start_datetime(s: str) -> datetime:
+    """
+    입력 예:
+    260601   -> 2026-06-01 00:00
+    26060114 -> 2026-06-01 14:00
+
+    형식:
+    YYMMDD 또는 YYMMDDHH
+    """
+    s = s.strip()
+
+    if not re.fullmatch(r"\d{6}(\d{2})?", s):
+        raise ValueError("날짜 형식은 YYMMDD 또는 YYMMDDHH 이어야 합니다. 예: 260601, 26060114")
+
+    yy = int(s[0:2])
+    mm = int(s[2:4])
+    dd = int(s[4:6])
+    hh = int(s[6:8]) if len(s) == 8 else 0
+
+    year = 2000 + yy
+
+    return datetime(year, mm, dd, hh, 0, 0)
+
+
+def outlook_datetime_string(dt: datetime) -> str:
+    """
+    Outlook Restrict 필터에서 사용할 날짜 문자열.
+    보통 MM/DD/YYYY HH:MM AM/PM 형식이 안정적입니다.
+    """
+    return dt.strftime("%m/%d/%Y %I:%M %p")
+
+
+# =========================
+# Outlook 연결
+# =========================
+
+def connect_outlook():
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    namespace = outlook.GetNamespace("MAPI")
+    return namespace
+
+
+def get_inbox(namespace):
+    # 6 = olFolderInbox
+    return namespace.GetDefaultFolder(6)
+
+
+# =========================
+# 발신자 정보 처리
+# =========================
+
+def get_sender_smtp_address(mail) -> str:
+    """
+    Exchange/SMTP 계정 모두 어느 정도 대응하기 위한 발신자 주소 추출 함수.
+    실패하면 빈 문자열 반환.
+    """
+    try:
+        if mail.SenderEmailType == "EX":
+            sender = mail.Sender
+            if sender is not None:
+                exch_user = sender.GetExchangeUser()
+                if exch_user is not None:
+                    return exch_user.PrimarySmtpAddress or ""
+        return mail.SenderEmailAddress or ""
+    except Exception:
+        return ""
+
+
+def get_sender_name(mail) -> str:
+    try:
+        return mail.SenderName or ""
+    except Exception:
+        return ""
+
+
+# =========================
+# 필터 조건
+# =========================
+
+def is_target_org_mail(mail) -> bool:
+    sender_email = get_sender_smtp_address(mail).lower()
+    sender_name = get_sender_name(mail).lower()
+
+    for keyword in TARGET_ORG_KEYWORDS:
+        k = keyword.lower()
+        if k in sender_email or k in sender_name:
+            return True
+
+    return False
+
+
+def is_target_subject(mail) -> bool:
+    try:
+        subject = mail.Subject or ""
+    except Exception:
+        subject = ""
+
+    subject_upper = subject.upper()
+
+    # 포함 조건
+    for keyword in SUBJECT_INCLUDE:
+        if keyword not in subject:
+            return False
+
+    # 제외 조건
+    for keyword in SUBJECT_EXCLUDE:
+        if keyword.upper() in subject_upper:
+            return False
+
+    return True
+
+
+def is_mail_item(item) -> bool:
+    """
+    Outlook 폴더에는 회의 요청, 리포트 등 MailItem이 아닌 항목도 있을 수 있음.
+    MailItem.Class == 43
+    """
+    try:
+        return item.Class == 43
+    except Exception:
+        return False
+
+
+# =========================
+# 커스텀 처리 Hook
+# =========================
+
+def process_mail(mail):
+    """
+    여기 안을 사용자가 원하는 세부 동작으로 커스텀하면 됨.
+    예:
+    - 본문 파싱
+    - 첨부파일 저장
+    - 특정 문자열 검사
+    - 엑셀 기록
+    - DB 저장
+    """
+
+    print("=" * 80)
+    print("수신시각:", mail.ReceivedTime)
+    print("보낸사람:", get_sender_name(mail), get_sender_smtp_address(mail))
+    print("제목:", mail.Subject)
+
+    # 본문 접근 예시
+    # body = mail.Body
+    # print(body[:500])
+
+    # 첨부파일 접근 예시
+    # attachments = mail.Attachments
+    # for i in range(1, attachments.Count + 1):
+    #     att = attachments.Item(i)
+    #     print("첨부:", att.FileName)
+    #     # att.SaveAsFile(r"C:\temp\\" + att.FileName)
+
+
+# =========================
+# 메인 조회 로직
+# =========================
+
+def list_and_process_mails(start_dt: datetime):
+    namespace = connect_outlook()
+    inbox = get_inbox(namespace)
+
+    items = inbox.Items
+
+    # 오래된 메일부터 순차 조회
+    items.Sort("[ReceivedTime]", False)
+
+    # 날짜 조건은 Outlook Restrict로 먼저 줄이고,
+    # 제목/발신자 조건은 Python에서 처리하는 방식이 디버깅하기 편함.
+    date_filter = f"[ReceivedTime] >= '{outlook_datetime_string(start_dt)}'"
+    restricted_items = items.Restrict(date_filter)
+
+    matched_count = 0
+    scanned_count = 0
+
+    for item in restricted_items:
+        if not is_mail_item(item):
+            continue
+
+        scanned_count += 1
+
+        if not is_target_org_mail(item):
+            continue
+
+        if not is_target_subject(item):
+            continue
+
+        matched_count += 1
+        process_mail(item)
+
+    print()
+    print(f"조회 완료. 스캔한 메일 수: {scanned_count}, 조건 일치 메일 수: {matched_count}")
+
+
+if __name__ == "__main__":
+    user_input = input("시작일시 입력, 예: 260601 또는 26060114: ")
+    start_dt = parse_start_datetime(user_input)
+
+    print("조회 시작 시각:", start_dt)
+    list_and_process_mails(start_dt)
